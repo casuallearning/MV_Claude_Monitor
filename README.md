@@ -50,7 +50,7 @@ Requires [Gemini CLI](https://www.npmjs.com/package/@google/gemini) installed
 ### One-line Installation
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/casuallearning/MonitorMV/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/casuallearning/MV_Claude_Monitor/main/install.sh | bash
 ```
 
 After installation, MonitorMV will guide you through initial setup on first run, or you can run:
@@ -62,7 +62,7 @@ monitormv --setup
 
 1. Download the tracker:
 ```bash
-curl -O https://raw.githubusercontent.com/casuallearning/MonitorMV/main/monitormv
+curl -O https://raw.githubusercontent.com/casuallearning/MV_Claude_Monitor/main/monitormv
 chmod +x monitormv
 ```
 
