@@ -539,26 +539,17 @@ class MonitorMV:
         # Remove duplicates and sort
         recent_timestamps = sorted(set(recent_timestamps))
         
-        # Find the most recent session start using configurable gap threshold
-        session_start_time = None
+        # If we found recent activity, show the current 5-hour window
+        # (the window you're currently in, regardless of when session started)
+        current_hour = (now.hour // 5) * 5
+        current_window_start = now.replace(hour=current_hour, minute=0, second=0, microsecond=0)
+        current_window_end = current_window_start + timedelta(hours=5)
         
-        # Work forward through timestamps to find the last gap > threshold
-        for i in range(1, len(recent_timestamps)):
-            current_time = recent_timestamps[i]
-            previous_time = recent_timestamps[i - 1]
-            
-            gap_hours = (current_time - previous_time).total_seconds() / 3600
-            if gap_hours > self.gap_threshold_hours:
-                session_start_time = current_time
+        # Handle the overnight window (20:00-01:00 next day)
+        if current_hour == 20:
+            current_window_end = current_window_start.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
         
-        # If no significant gap found, use the first recent message
-        if session_start_time is None:
-            session_start_time = recent_timestamps[0]
-        
-        session_start = session_start_time
-        session_end = session_start + timedelta(hours=5)
-        
-        return session_start, session_end
+        return current_window_start, current_window_end
     
     def get_daily_window(self):
         """Get current daily window for Gemini"""
