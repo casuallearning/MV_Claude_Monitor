@@ -1463,7 +1463,7 @@ def self_update():
     print("\nChecking for updates...")
     
     # GitHub raw URL for the latest version
-    update_url = "https://raw.githubusercontent.com/casuallearning/MonitorMV/main/monitormv"
+    update_url = "https://raw.githubusercontent.com/casuallearning/MV_Claude_Monitor/main/monitormv"
     
     try:
         # Download to temporary file
