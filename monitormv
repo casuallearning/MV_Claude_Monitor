@@ -485,8 +485,10 @@ class MonitorMV:
         if hour == 20:
             default_end = default_start.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
         
-        # Only scan files modified in the last 24 hours for better performance
-        cutoff_time = now - timedelta(hours=24)
+        # Look back further to catch sleep/weekend gaps - files modified in last 72 hours
+        file_cutoff_time = now - timedelta(hours=72)
+        # But consider messages from last 48 hours to catch proper gaps
+        message_cutoff_time = now - timedelta(hours=48)
         recent_timestamps = []
         
         try:
@@ -494,16 +496,16 @@ class MonitorMV:
                 if project_dir.is_dir():
                     for jsonl_file in project_dir.glob('*.jsonl'):
                         try:
-                            # Skip files not modified recently
+                            # Skip files not modified in last 72 hours
                             file_mtime = datetime.fromtimestamp(jsonl_file.stat().st_mtime).replace(tzinfo=timezone.utc).replace(tzinfo=None)
-                            if file_mtime < cutoff_time:
+                            if file_mtime < file_cutoff_time:
                                 continue
                                 
-                            # Only scan the last few lines for performance
+                            # Scan more lines for better gap detection, but still be reasonable
                             with open(jsonl_file, 'r') as f:
                                 lines = f.readlines()
-                                # Only check last 50 lines for recent activity
-                                for line in lines[-50:]:
+                                # Check last 100 lines to catch more session patterns
+                                for line in lines[-100:]:
                                     if not line.strip():
                                         continue
                                     try:
@@ -512,8 +514,8 @@ class MonitorMV:
                                             msg_time = datetime.fromisoformat(entry['timestamp'].replace('Z', '+00:00'))
                                             if msg_time.tzinfo:
                                                 msg_time = msg_time.replace(tzinfo=None)
-                                            # Only consider messages from the last 12 hours
-                                            if msg_time >= cutoff_time:
+                                            # Consider messages from the last 48 hours for gap detection
+                                            if msg_time >= message_cutoff_time:
                                                 msg_time_rounded = msg_time.replace(minute=0, second=0, microsecond=0)
                                                 recent_timestamps.append(msg_time_rounded)
                                     except json.JSONDecodeError:
@@ -897,8 +899,10 @@ class MonitorMV:
         timezone_display = self.config['preferences'].get('timezone_display', 'local')
         
         if timezone_display == 'utc':
+            # utc_time is already a naive datetime representing UTC, just format it
             return utc_time.strftime('%H:%M') + ' UTC'
         else:
+            # Convert the naive UTC time to local timezone for display
             local_time = utc_time.replace(tzinfo=timezone.utc).astimezone()
             return local_time.strftime('%H:%M')
         
