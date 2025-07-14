@@ -460,14 +460,15 @@ class MonitorMV:
                     # If the time is in the future, use yesterday
                     if session_start > now:
                         session_start -= timedelta(days=1)
+                    session_end = session_start + timedelta(hours=5)
+                    return session_start, session_end
                 except:
                     # Fallback if parsing fails
-                    session_start = self.get_fast_session_window()
+                    return self.get_fast_session_window()
             else:
                 session_start = self.manual_session_start
-            
-            session_end = session_start + timedelta(hours=5)
-            return session_start, session_end
+                session_end = session_start + timedelta(hours=5)
+                return session_start, session_end
         
         # Use fast detection for normal operation
         return self.get_fast_session_window()
@@ -550,10 +551,6 @@ class MonitorMV:
         
         session_start = session_start_time
         session_end = session_start + timedelta(hours=5)
-        
-        # If the current session has expired, use current time block
-        if now >= session_end:
-            return default_start, default_end
         
         return session_start, session_end
     
