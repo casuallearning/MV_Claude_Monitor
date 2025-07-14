@@ -38,7 +38,7 @@ import tempfile
 import shutil
 import re
 
-__version__ = "5.8.0"
+__version__ = "5.9.0"
 __author__ = "Phil Hudson / Mea Vita"
 __app_name__ = "MonitorMV"
 
@@ -101,7 +101,8 @@ class ConfigManager:
                 'show_cost_projections': True,
                 'refresh_interval': 5,
                 'theme': 'default',
-                'timezone_display': 'local'  # 'local', 'utc'
+                'timezone_display': 'local',  # 'local', 'utc'
+                'gap_threshold_hours': 3.0  # Hours of inactivity before new session
             }
         }
         
@@ -265,7 +266,7 @@ class ConfigManager:
         return 0
 
 class MonitorMV:
-    def __init__(self, plan=None, service=None, config=None):
+    def __init__(self, plan=None, service=None, config=None, session_start=None):
         # Load configuration
         self.config_manager = ConfigManager()
         self.config = config or self.config_manager.load_config()
@@ -276,6 +277,10 @@ class MonitorMV:
             self.service = self.config['preferences']['default_view']
             
         self.services_found = []
+        
+        # Session override and performance settings
+        self.manual_session_start = session_start
+        self.gap_threshold_hours = self.config['preferences'].get('gap_threshold_hours', 3.0)  # Default 3 hours instead of 1
         
         # Auto-detect plan if not specified
         if plan:
@@ -442,83 +447,111 @@ class MonitorMV:
         return self.model_weights.get(model_type, 1.0)
         
     def get_session_window(self):
-        """Get current 5-hour session window for Claude based on first message after gap"""
+        """Get current 5-hour session window for Claude - optimized for speed"""
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         
-        # Collect all user message timestamps
-        all_timestamps = []
-        for project_dir in self.claude_dir.iterdir():
-            if project_dir.is_dir():
-                for jsonl_file in project_dir.glob('*.jsonl'):
-                    try:
-                        with open(jsonl_file, 'r') as f:
-                            for line in f:
-                                if not line.strip():
-                                    continue
-                                try:
-                                    entry = json.loads(line)
-                                    if 'timestamp' in entry and entry.get('type') == 'user':
-                                        msg_time = datetime.fromisoformat(entry['timestamp'].replace('Z', '+00:00'))
-                                        if msg_time.tzinfo:
-                                            msg_time = msg_time.replace(tzinfo=None)
-                                        # Round down to nearest hour before adding to list
-                                        msg_time_rounded = msg_time.replace(minute=0, second=0, microsecond=0)
-                                        all_timestamps.append(msg_time_rounded)
-                                except json.JSONDecodeError:
-                                    continue
-                    except:
-                        continue
+        # If manual session start is specified, use it
+        if self.manual_session_start:
+            if isinstance(self.manual_session_start, str):
+                # Parse time string like "10:00"
+                try:
+                    hour, minute = map(int, self.manual_session_start.split(':'))
+                    session_start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    # If the time is in the future, use yesterday
+                    if session_start > now:
+                        session_start -= timedelta(days=1)
+                except:
+                    # Fallback if parsing fails
+                    session_start = self.get_fast_session_window()
+            else:
+                session_start = self.manual_session_start
+            
+            session_end = session_start + timedelta(hours=5)
+            return session_start, session_end
         
-        if all_timestamps:
-            # Remove duplicates and sort timestamps chronologically
-            all_timestamps = sorted(set(all_timestamps))
+        # Use fast detection for normal operation
+        return self.get_fast_session_window()
+    
+    def get_fast_session_window(self):
+        """Fast session window detection - only scans recent files"""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        
+        # Default to current 5-hour block for speed
+        hour = (now.hour // 5) * 5
+        default_start = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        default_end = default_start + timedelta(hours=5)
+        
+        # Handle the overnight window (20:00-01:00 next day)
+        if hour == 20:
+            default_end = default_start.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        
+        # Only scan files modified in the last 24 hours for better performance
+        cutoff_time = now - timedelta(hours=24)
+        recent_timestamps = []
+        
+        try:
+            for project_dir in self.claude_dir.iterdir():
+                if project_dir.is_dir():
+                    for jsonl_file in project_dir.glob('*.jsonl'):
+                        try:
+                            # Skip files not modified recently
+                            file_mtime = datetime.fromtimestamp(jsonl_file.stat().st_mtime).replace(tzinfo=timezone.utc).replace(tzinfo=None)
+                            if file_mtime < cutoff_time:
+                                continue
+                                
+                            # Only scan the last few lines for performance
+                            with open(jsonl_file, 'r') as f:
+                                lines = f.readlines()
+                                # Only check last 50 lines for recent activity
+                                for line in lines[-50:]:
+                                    if not line.strip():
+                                        continue
+                                    try:
+                                        entry = json.loads(line)
+                                        if 'timestamp' in entry and entry.get('type') == 'user':
+                                            msg_time = datetime.fromisoformat(entry['timestamp'].replace('Z', '+00:00'))
+                                            if msg_time.tzinfo:
+                                                msg_time = msg_time.replace(tzinfo=None)
+                                            # Only consider messages from the last 12 hours
+                                            if msg_time >= cutoff_time:
+                                                msg_time_rounded = msg_time.replace(minute=0, second=0, microsecond=0)
+                                                recent_timestamps.append(msg_time_rounded)
+                                    except json.JSONDecodeError:
+                                        continue
+                        except:
+                            continue
+        except:
+            # If anything fails, use default
+            return default_start, default_end
+        
+        if not recent_timestamps:
+            return default_start, default_end
+        
+        # Remove duplicates and sort
+        recent_timestamps = sorted(set(recent_timestamps))
+        
+        # Find the most recent session start using configurable gap threshold
+        session_start_time = None
+        
+        # Work forward through timestamps to find the last gap > threshold
+        for i in range(1, len(recent_timestamps)):
+            current_time = recent_timestamps[i]
+            previous_time = recent_timestamps[i - 1]
             
-            # Find the most recent message after a gap of more than 1 hour
-            session_start_time = None
-            
-            # Work forward through timestamps to find the last gap > 1 hour
-            for i in range(1, len(all_timestamps)):
-                current_time = all_timestamps[i]
-                previous_time = all_timestamps[i - 1]
-                
-                # Check if there's a gap of more than 1 hour (timestamps are already rounded to hours)
-                gap_hours = (current_time - previous_time).total_seconds() / 3600
-                if gap_hours > 1.0:
-                    # The current message is after a gap - this could be our session start
-                    session_start_time = current_time
-            
-            # If no gap found, use the first message overall
-            if session_start_time is None:
-                session_start_time = all_timestamps[0]
-            
-            # Timestamps are already rounded to the nearest hour
-            session_start = session_start_time
-            session_end = session_start + timedelta(hours=5)
-            
-            # If the current session has expired, find the next session
-            while now >= session_end:
-                # Look for the next message after this session ended
-                next_session_start = None
-                for timestamp in all_timestamps:
-                    if timestamp >= session_end:
-                        next_session_start = timestamp
-                        break
-                
-                if next_session_start:
-                    session_start = next_session_start
-                    session_end = session_start + timedelta(hours=5)
-                else:
-                    # No more messages, break out of loop
-                    break
-        else:
-            # Fallback to fixed blocks if no messages found
-            hour = (now.hour // 5) * 5
-            session_start = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-            session_end = session_start + timedelta(hours=5)
-            
-            # Handle the overnight window (20:00-01:00 next day)
-            if hour == 20:
-                session_end = session_start.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            gap_hours = (current_time - previous_time).total_seconds() / 3600
+            if gap_hours > self.gap_threshold_hours:
+                session_start_time = current_time
+        
+        # If no significant gap found, use the first recent message
+        if session_start_time is None:
+            session_start_time = recent_timestamps[0]
+        
+        session_start = session_start_time
+        session_end = session_start + timedelta(hours=5)
+        
+        # If the current session has expired, use current time block
+        if now >= session_end:
+            return default_start, default_end
         
         return session_start, session_end
     
@@ -1737,6 +1770,10 @@ def main():
                                            'gemini-free', 'gemini-paid', 'gemini-api',
                                            'pro', 'max5', 'max20'],  # Keep old options for compatibility
                         help='Subscription plan (default: auto-detect)')
+    parser.add_argument('--session-start', metavar='TIME',
+                        help='Override session start time (e.g., "10:00")')
+    parser.add_argument('--gap-hours', type=float, metavar='HOURS',
+                        help='Hours of inactivity before new session (default: 3.0)')
     parser.add_argument('--simple', action='store_true',
                         help='Use simple text mode')
     parser.add_argument('--once', action='store_true',
@@ -1787,7 +1824,11 @@ def main():
         else:
             config = config_manager.load_config()
             
-        tracker = MonitorMV(plan=args.plan, service=args.service, config=config)
+        # Apply gap threshold override if specified
+        if args.gap_hours:
+            config['preferences']['gap_threshold_hours'] = args.gap_hours
+            
+        tracker = MonitorMV(plan=args.plan, service=args.service, config=config, session_start=args.session_start)
         
         if args.once:
             tracker.run_once()

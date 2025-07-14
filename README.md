@@ -1,80 +1,56 @@
 # MonitorMV
 
-**Part of the Mea Vita AI Development Suite**
+A simple tool to track your AI usage for Claude and Gemini subscriptions.
 
-A universal AI usage monitor that accurately tracks resource consumption for Claude and Gemini AI subscriptions.
+If you're like me and use AI tools for work, you've probably wondered "how much am I actually using these subscriptions?" The built-in usage meters don't always tell the full story, especially with model weighting and session windows.
 
-Built by Phil Hudson / Mea Vita - Crafting quality AI tools for the developer community.
+MonitorMV reads your local AI logs and gives you a clearer picture of your actual usage patterns.
 
-## Currently Supported
-- ✅ **Claude AI** - Full support for Pro/Max subscriptions with accurate model weighting
-- ✅ **Google Gemini** - Full support for CLI usage tracking with model differentiation
+## What it supports
+- Claude AI (Pro/Max subscriptions) 
+- Google Gemini (CLI usage)
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Python](https://img.shields.io/badge/python-3.6+-blue.svg)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
+## Why I built this
 
-## Why MonitorMV?
-
-AI subscriptions don't track usage like API keys. MonitorMV provides accurate tracking for:
+AI subscription limits work differently than API billing:
 
 ### Claude Pro/Max
-- **Opus models** use 5x resources per message
-- **Sonnet models** use 1x resources (baseline)
-- **Haiku models** use 0.25x resources
+- Opus models use 5x resources per message
+- Sonnet models use 1x resources (baseline)  
+- Haiku models use 0.25x resources
 
 ### Google Gemini
-- **Gemini 2.5 Pro** - State-of-the-art reasoning (1x weight)
-- **Gemini 2.5 Flash** - Cost-efficient, fast responses (0.1x weight)
-- **Gemini 2.0 Flash** - Next-gen with 1M token context (0.1x weight)
-- **Gemini 1.5 Pro/Flash** - Previous generation models
+- Different models have different resource costs
+- Daily request limits vary by subscription tier
+- Requires [Gemini CLI](https://www.npmjs.com/package/@google/gemini) installed
 
-Requires [Gemini CLI](https://www.npmjs.com/package/@google/gemini) installed
+## What it does
 
-## Features
+- Shows real-time usage tracking for your current session
+- Accounts for model weighting (Opus uses more resources than Haiku)
+- Tracks multiple sessions across different projects
+- Detects session windows intelligently based on your usage patterns
+- Shows token statistics and estimated API costs
+- Works with both local timezone and UTC display
+- Updates automatically when new versions are available
 
-- 📊 **Real-time Usage Tracking** - Monitor resource consumption across all Claude sessions
-- ⚖️ **Accurate Model Weighting** - Reflects actual resource usage (Opus 5x, Sonnet 1x, Haiku 0.25x)
-- 🎯 **Multi-Session Support** - Tracks all active AI sessions across different interfaces
-- ⏰ **Smart Session Windows** - Dynamic 5-hour windows based on actual usage patterns
-- 📈 **Usage Predictions** - Warns if you're on track to exceed limits
-- 💾 **Token Statistics** - Detailed breakdown of input, output, and cache tokens
-- 🚀 **Zero Configuration** - Works out of the box, auto-detects usage
-- 💰 **Cost Projections** - Shows estimated API costs based on actual token usage
-- 🎨 **Subscription Aware** - Tracks free tier, paid subscriptions, and API usage differently
-- 🌍 **Timezone Support** - Display times in local timezone or UTC
-- 🔄 **Self-Updating** - Built-in updater with `monitormv --update`
+The goal is just to give you a better sense of how you're using your AI subscriptions.
 
-## Quick Start
+## Installation
 
-### One-line Installation
-
+### Quick install
 ```bash
 curl -fsSL https://raw.githubusercontent.com/casuallearning/MV_Claude_Monitor/main/install.sh | bash
 ```
 
-After installation, MonitorMV will guide you through initial setup on first run, or you can run:
-```bash
-monitormv --setup
-```
-
-### Manual Installation
-
-1. Download the tracker:
+### Manual install
 ```bash
 curl -O https://raw.githubusercontent.com/casuallearning/MV_Claude_Monitor/main/monitormv
 chmod +x monitormv
-```
-
-2. Install to system path:
-```bash
 sudo cp monitormv /usr/local/bin/monitormv
 ```
 
-3. Run:
-```bash
-monitormv
-```
+Then just run `monitormv` - it'll walk you through setup on first use.
 
 ## Usage
 
@@ -222,30 +198,24 @@ MonitorMV reads the local session files created by Claude Desktop (`~/.claude/pr
 5. Tracks both subscription limits and API cost projections
 6. Supports timezone display preferences (local time or UTC)
 
-## Why Not Use Existing Tools?
+## How it works
 
-Most Claude monitoring tools were built for API usage and don't understand Pro/Max subscription limits:
-- They count tokens instead of messages
-- They don't apply model weighting
-- They don't understand 5-hour session windows
-- They count cache reads as usage (which are free for Pro/Max)
+MonitorMV reads the local session files that Claude Desktop and Gemini CLI create:
+- Figures out your current 5-hour session window based on when you actually use the tools
+- Counts messages and applies the resource weights that match how Claude actually bills
+- Shows token usage for reference (helpful for understanding API costs)
+- Tries to be fast by only scanning recent files instead of your entire history
 
-MonitorMV was built specifically for AI subscriptions to provide accurate resource tracking.
+It's not perfect, but it gives a much better picture than trying to track usage manually.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+If you find bugs or have ideas for improvements, feel free to open an issue or submit a pull request.
 
 ## License
 
 MIT License - see LICENSE file for details
 
-## Acknowledgments
-
-Built by **Phil Hudson / Mea Vita** with insights from the Claude community and based on official Anthropic documentation about Pro/Max resource usage.
-
 ---
 
-**MonitorMV** is part of the Mea Vita suite of AI development tools. Follow our work and discover more quality tools at [github.com/casuallearning](https://github.com/casuallearning).
-
-**Note**: This is an unofficial tool. Not affiliated with Anthropic.
+This is an unofficial tool, not affiliated with Anthropic or Google. Just something I built to better understand my own AI usage patterns.

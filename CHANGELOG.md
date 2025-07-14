@@ -1,5 +1,26 @@
 # MonitorMV Changelog
 
+## v5.9.0 (2025-07-14)
+
+### Performance & User Experience
+- **⚡ Significantly Faster Startup**: Only scans files modified in the last 24 hours instead of entire history
+- **🎯 Manual Session Override**: New `--session-start "10:00"` flag to manually set session start time
+- **⚙️ Configurable Gap Threshold**: New `--gap-hours 3.0` flag to customize when new sessions start (default now 3 hours instead of 1)
+- **📝 Humble Documentation**: Rewrote README to be more conversational and less marketing-heavy
+- **🔧 Smart File Scanning**: Only reads last 50 lines of recent files for session detection
+
+### Technical Improvements
+- Added `get_fast_session_window()` method for optimized session detection
+- Configurable gap threshold in user preferences (defaults to 3.0 hours)
+- Manual session start support in MonitorMV constructor
+- Better fallback handling when file scanning fails
+- Only processes messages from the last 12 hours for session detection
+
+### Bug Fixes
+- Fixed overly aggressive session detection that treated lunch breaks as new sessions
+- Improved error handling for corrupted or missing files
+- Better timezone handling in fast session detection
+
 ## v5.8.0 (2025-07-14)
 
 ### Major Features
