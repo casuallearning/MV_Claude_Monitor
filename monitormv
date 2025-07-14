@@ -456,12 +456,18 @@ class MonitorMV:
                 # Parse time string like "10:00"
                 try:
                     hour, minute = map(int, self.manual_session_start.split(':'))
-                    session_start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                    # If the time is in the future, use yesterday
-                    if session_start > now:
-                        session_start -= timedelta(days=1)
-                    session_end = session_start + timedelta(hours=5)
-                    return session_start, session_end
+                    # Use local time for manual session start, then convert to UTC
+                    local_now = datetime.now()
+                    local_session_start = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    
+                    # If the time is in the future, use yesterday  
+                    if local_session_start > local_now:
+                        local_session_start -= timedelta(days=1)
+                    
+                    # Convert local time to UTC for internal processing
+                    utc_session_start = local_session_start.astimezone(timezone.utc).replace(tzinfo=None)
+                    session_end = utc_session_start + timedelta(hours=5)
+                    return utc_session_start, session_end
                 except:
                     # Fallback if parsing fails
                     return self.get_fast_session_window()
