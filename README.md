@@ -7,7 +7,8 @@ If you're like me and use AI tools for work, you've probably wondered "how much 
 MonitorMV reads your local AI logs and gives you a clearer picture of your actual usage patterns.
 
 ## What it supports
-- Claude AI (Pro/Max subscriptions) 
+- Claude AI (Pro/Max subscriptions)
+- Probably API (I would test it but last time it cost me $100 in 15 minutes to "try" the API)
 - Google Gemini (CLI usage)
 
 ## Why I built this
