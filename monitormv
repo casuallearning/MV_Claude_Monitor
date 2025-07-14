@@ -1,0 +1,1812 @@
+#!/usr/bin/env python3
+"""
+MonitorMV - Universal AI usage monitor for Claude and Gemini subscriptions
+Part of the Mea Vita suite of AI development tools
+
+Accurately tracks resource consumption across AI sessions:
+- Claude: Tracks Pro/Max subscriptions with model-based weighting
+- Gemini: Coming soon - Pro subscription tracking
+
+Copyright (c) 2024 Phil Hudson / Mea Vita
+License: MIT
+GitHub: https://github.com/casuallearning/MonitorMV
+
+Installation:
+1. chmod +x monitormv
+2. sudo cp monitormv /usr/local/bin/monitormv
+3. Run: monitormv
+
+Usage:
+  monitormv                # Auto-detect and monitor all AI services
+  monitormv --claude       # Monitor only Claude usage
+  monitormv --gemini       # Monitor only Gemini usage (coming soon)
+  monitormv --simple       # Simple text mode
+  monitormv --plan pro     # Specify plan (claude:pro/max5/max20)
+  monitormv --once         # Run once and exit
+"""
+import json
+import os
+import sys
+import time
+import curses
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections import defaultdict
+import argparse
+import subprocess
+import tempfile
+import shutil
+import re
+
+__version__ = "5.8.0"
+__author__ = "Phil Hudson / Mea Vita"
+__app_name__ = "MonitorMV"
+
+# Integrated Configuration Manager
+class ConfigManager:
+    def __init__(self):
+        self.config_dir = Path.home() / '.monitormv'
+        self.config_file = self.config_dir / 'config.json'
+        self.config_dir.mkdir(exist_ok=True)
+        
+        # API Pricing (as of 2024)
+        self.api_pricing = {
+            'claude': {
+                # Prices per million tokens
+                'claude-3-opus-20240229': {'input': 15.00, 'output': 75.00},
+                'claude-3-5-sonnet-20241022': {'input': 3.00, 'output': 15.00},
+                'claude-3-5-sonnet-20240620': {'input': 3.00, 'output': 15.00},
+                'claude-3-sonnet-20240229': {'input': 3.00, 'output': 15.00},
+                'claude-3-5-haiku-20241022': {'input': 1.00, 'output': 5.00},
+                'claude-3-haiku-20240307': {'input': 0.25, 'output': 1.25},
+            },
+            'gemini': {
+                # Prices per million tokens (varies by context size)
+                'gemini-1.5-pro': {
+                    '128k': {'input': 1.25, 'output': 5.00},
+                    '1m': {'input': 2.50, 'output': 10.00},
+                    '2m': {'input': 3.50, 'output': 10.50}
+                },
+                'gemini-1.5-flash': {
+                    '128k': {'input': 0.075, 'output': 0.30},
+                    '1m': {'input': 0.15, 'output': 0.60},
+                    '2m': {'input': 0.30, 'output': 1.20}
+                },
+                'gemini-2.0-flash': {
+                    'standard': {'input': 0.075, 'output': 0.30}
+                }
+            }
+        }
+        
+        # Default configuration
+        self.default_config = {
+            'version': '1.0',
+            'created': datetime.now().isoformat(),
+            'services': {
+                'claude': {
+                    'enabled': False,
+                    'subscription_type': None,  # 'free', 'pro', 'team', 'api'
+                    'plan': None,  # 'pro', 'max5', 'max20'
+                    'api_key_set': False
+                },
+                'gemini': {
+                    'enabled': False,
+                    'subscription_type': None,  # 'free', 'paid', 'api'
+                    'billing_enabled': False,
+                    'api_key_set': False
+                }
+            },
+            'preferences': {
+                'default_view': 'all',  # 'all', 'claude', 'gemini'
+                'show_cost_projections': True,
+                'refresh_interval': 5,
+                'theme': 'default',
+                'timezone_display': 'local'  # 'local', 'utc'
+            }
+        }
+        
+    def load_config(self):
+        """Load configuration from file"""
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return self.default_config.copy()
+        return self.default_config.copy()
+        
+    def save_config(self, config):
+        """Save configuration to file"""
+        config['last_updated'] = datetime.now().isoformat()
+        with open(self.config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+            
+    def run_initial_setup(self):
+        """Run initial setup wizard"""
+        print("\n🎉 Welcome to MonitorMV Initial Setup!")
+        print("=" * 50)
+        print("Let's configure your AI service monitoring.\n")
+        
+        config = self.default_config.copy()
+        
+        # Claude setup
+        print("📘 Claude AI Setup")
+        print("-" * 30)
+        claude_choice = input("Do you use Claude AI? (y/n): ").lower().strip()
+        
+        if claude_choice == 'y':
+            config['services']['claude']['enabled'] = True
+            print("\nWhat type of Claude subscription do you have?")
+            print("1. Free tier")
+            print("2. Claude Pro")
+            print("3. Claude Max 5x")
+            print("4. Claude Max 20x")
+            print("5. API access only")
+            
+            sub_choice = input("\nEnter choice (1-5): ").strip()
+            
+            if sub_choice == '1':
+                config['services']['claude']['subscription_type'] = 'free'
+            elif sub_choice == '2':
+                config['services']['claude']['subscription_type'] = 'pro'
+                config['services']['claude']['plan'] = 'pro'
+                print("\n✅ Claude Pro configured (45 messages per 5 hours)")
+            elif sub_choice == '3':
+                config['services']['claude']['subscription_type'] = 'team'
+                config['services']['claude']['plan'] = 'max5'
+                print("\n✅ Claude Max 5x configured (225 messages per 5 hours)")
+            elif sub_choice == '4':
+                config['services']['claude']['subscription_type'] = 'team'
+                config['services']['claude']['plan'] = 'max20'
+                print("\n✅ Claude Max 20x configured (900 messages per 5 hours)")
+            elif sub_choice == '5':
+                config['services']['claude']['subscription_type'] = 'api'
+                has_key = input("\nDo you have your API key set in environment variables? (y/n): ").lower().strip()
+                config['services']['claude']['api_key_set'] = has_key == 'y'
+                
+        # Gemini setup
+        print("\n\n💎 Google Gemini Setup")
+        print("-" * 30)
+        gemini_choice = input("Do you use Google Gemini? (y/n): ").lower().strip()
+        
+        if gemini_choice == 'y':
+            config['services']['gemini']['enabled'] = True
+            print("\nWhat type of Gemini access do you have?")
+            print("1. Free tier")
+            print("2. Pay-as-you-go billing enabled")
+            print("3. API access with billing")
+            
+            gem_choice = input("\nEnter choice (1-3): ").strip()
+            
+            if gem_choice == '1':
+                config['services']['gemini']['subscription_type'] = 'free'
+                print("\n✅ Gemini Free tier configured (15 RPM)")
+            elif gem_choice == '2':
+                config['services']['gemini']['subscription_type'] = 'paid'
+                config['services']['gemini']['billing_enabled'] = True
+                print("\n✅ Gemini with billing configured (1000 RPM for Pro models)")
+            elif gem_choice == '3':
+                config['services']['gemini']['subscription_type'] = 'api'
+                config['services']['gemini']['billing_enabled'] = True
+                has_key = input("\nDo you have your API key set in environment variables? (y/n): ").lower().strip()
+                config['services']['gemini']['api_key_set'] = has_key == 'y'
+                
+        # Preferences
+        print("\n\n⚙️  Preferences")
+        print("-" * 30)
+        
+        if config['services']['claude']['enabled'] and config['services']['gemini']['enabled']:
+            print("Default view when launching MonitorMV:")
+            print("1. Show all services")
+            print("2. Show only Claude")
+            print("3. Show only Gemini")
+            view_choice = input("\nEnter choice (1-3) [default: 1]: ").strip() or '1'
+            
+            if view_choice == '2':
+                config['preferences']['default_view'] = 'claude'
+            elif view_choice == '3':
+                config['preferences']['default_view'] = 'gemini'
+                
+        show_costs = input("\nShow cost projections based on API pricing? (y/n) [default: y]: ").lower().strip()
+        config['preferences']['show_cost_projections'] = show_costs != 'n'
+        
+        print("\nTimezone display preference:")
+        print("1. Show times in device local timezone")
+        print("2. Show times in UTC")
+        timezone_choice = input("\nEnter choice (1-2) [default: 1]: ").strip() or '1'
+        
+        if timezone_choice == '2':
+            config['preferences']['timezone_display'] = 'utc'
+        else:
+            config['preferences']['timezone_display'] = 'local'
+        
+        # Save configuration
+        self.save_config(config)
+        
+        print("\n\n✅ Setup Complete!")
+        print("=" * 50)
+        print("Your configuration has been saved to:", self.config_file)
+        print("\nYou can run setup again anytime with: monitormv --setup")
+        print("Edit config manually at:", self.config_file)
+        
+        return config
+        
+    def get_api_price(self, service, model, token_type='input'):
+        """Get API price for a specific model"""
+        if service == 'claude':
+            # Find the closest matching model
+            for api_model, prices in self.api_pricing['claude'].items():
+                if model.lower() in api_model.lower() or api_model.lower() in model.lower():
+                    return prices.get(token_type, 0)
+                    
+            # Fallback based on model type
+            if 'opus' in model.lower():
+                return self.api_pricing['claude']['claude-3-opus-20240229'][token_type]
+            elif 'sonnet' in model.lower():
+                return self.api_pricing['claude']['claude-3-5-sonnet-20241022'][token_type]
+            elif 'haiku' in model.lower():
+                return self.api_pricing['claude']['claude-3-5-haiku-20241022'][token_type]
+                
+        elif service == 'gemini':
+            # Simplified Gemini pricing
+            if '2.5-pro' in model.lower() or '2.0-pro' in model.lower():
+                # Assume similar pricing to 1.5-pro for newer models
+                return self.api_pricing['gemini']['gemini-1.5-pro']['128k'][token_type]
+            elif '2.5-flash' in model.lower():
+                # Assume similar pricing to 2.0-flash
+                return self.api_pricing['gemini']['gemini-2.0-flash']['standard'][token_type]
+            elif '1.5-pro' in model.lower():
+                return self.api_pricing['gemini']['gemini-1.5-pro']['128k'][token_type]
+            elif '1.5-flash' in model.lower():
+                return self.api_pricing['gemini']['gemini-1.5-flash']['128k'][token_type]
+            elif '2.0-flash' in model.lower():
+                return self.api_pricing['gemini']['gemini-2.0-flash']['standard'][token_type]
+                
+        return 0
+
+class MonitorMV:
+    def __init__(self, plan=None, service=None, config=None):
+        # Load configuration
+        self.config_manager = ConfigManager()
+        self.config = config or self.config_manager.load_config()
+        
+        # Service detection
+        self.service = service  # 'claude', 'gemini', or None for auto
+        if not service and self.config['preferences']['default_view'] != 'all':
+            self.service = self.config['preferences']['default_view']
+            
+        self.services_found = []
+        
+        # Auto-detect plan if not specified
+        if plan:
+            # Handle new plan format
+            if plan.startswith('claude-'):
+                self.claude_plan = plan.replace('claude-', '')
+                self.gemini_plan = self.config['services']['gemini'].get('subscription_type', 'free')
+            elif plan.startswith('gemini-'):
+                self.claude_plan = self.config['services']['claude'].get('plan', 'pro')
+                self.gemini_plan = plan.replace('gemini-', '')
+            else:
+                # Legacy format
+                self.claude_plan = plan if plan in ['pro', 'max5', 'max20'] else 'pro'
+                self.gemini_plan = self.config['services']['gemini'].get('subscription_type', 'free')
+        else:
+            self.claude_plan = self.detect_claude_plan()
+            self.gemini_plan = self.detect_gemini_plan()
+        
+        # For compatibility
+        self.plan = self.claude_plan
+        
+        # Base message limits
+        self.claude_limits = {
+            'pro': 45,      # Claude Pro - per 5 hours
+            'max5': 225,    # Claude Max 5x - per 5 hours
+            'max20': 900,   # Claude Max 20x - per 5 hours
+            'api': float('inf'),  # No limit for API
+            'free': 10      # Rough estimate for free tier
+        }
+        
+        # Updated Gemini limits based on official documentation
+        # Free tier: 15 RPM, 2M TPM, 1500 RPD
+        # Paid tier: 360 RPM, 4M TPM, 30000 RPD  
+        self.gemini_limits = {
+            'free': 1500,    # 1500 requests per day
+            'paid': 30000,   # 30000 requests per day
+            'api': float('inf')  # No limit for API
+        }
+        self.base_limit = self.claude_limits.get(self.claude_plan, 900)
+        
+        # Model resource multipliers
+        self.model_weights = {
+            # Claude models (confirmed by Anthropic)
+            'opus': 5.0,    # Opus uses 5x resources
+            'sonnet': 1.0,  # Sonnet is baseline
+            'haiku': 0.25,  # Haiku uses 1/4 resources
+            # Gemini models (based on pricing/performance)
+            'gemini-2.5-pro': 1.0,     # Baseline
+            'gemini-2.5-flash': 0.1,   # 10x cheaper/faster
+            'gemini-2.0-flash': 0.1,   # Similar to 2.5 flash
+            'gemini-1.5-pro': 1.0,     # Similar to 2.5 pro
+            'gemini-1.5-flash': 0.1    # Budget option
+        }
+        
+        # Check for available AI services
+        self.check_available_services()
+        
+        # Set up directories based on services
+        self.claude_dir = Path.home() / '.claude' / 'projects'
+        self.gemini_dir = Path.home() / '.gemini' / 'tmp'
+        
+        # Validate requested services are available
+        if self.service == 'claude' and 'claude' not in self.services_found:
+            print(f"❌ Claude directory not found at {self.claude_dir}")
+            print("Make sure Claude desktop is installed and you've used it at least once.")
+            sys.exit(1)
+            
+        if self.service == 'gemini' and 'gemini' not in self.services_found:
+            print(f"❌ Gemini directory not found at {self.gemini_dir}")
+            print("Make sure Gemini CLI is installed and you've used it at least once.")
+            print("\nInstall with: npm install -g @google/gemini")
+            sys.exit(1)
+            
+        if not self.services_found:
+            print("❌ No AI services found!")
+            print("\nMonitorMV requires at least one of:")
+            print("- Claude Desktop (~/.claude/projects)")
+            print("- Gemini CLI (~/.gemini/tmp)")
+            print("\nPart of the Mea Vita suite of AI development tools.")
+            print("Visit https://github.com/casuallearning for more tools.")
+            sys.exit(1)
+            
+    def check_available_services(self):
+        """Check which AI services are available on this system"""
+        self.services_found = []
+        
+        # Check for Claude
+        claude_dir = Path.home() / '.claude' / 'projects'
+        if claude_dir.exists():
+            self.services_found.append('claude')
+            
+        # Check for Gemini
+        gemini_dir = Path.home() / '.gemini' / 'tmp'
+        if gemini_dir.exists():
+            self.services_found.append('gemini')
+            
+        # If specific service requested, filter
+        if self.service:
+            self.services_found = [s for s in self.services_found if s == self.service]
+            
+    def detect_claude_plan(self):
+        """Auto-detect Claude plan based on configuration"""
+        if self.config['services']['claude']['enabled']:
+            plan = self.config['services']['claude'].get('plan')
+            if plan:
+                return plan
+            # Check subscription type
+            sub_type = self.config['services']['claude'].get('subscription_type')
+            if sub_type == 'api':
+                return 'api'
+            elif sub_type == 'free':
+                return 'free'
+        return 'max20'  # Default for power users
+    
+    def detect_gemini_plan(self):
+        """Auto-detect Gemini plan based on configuration"""
+        if self.config['services']['gemini']['enabled']:
+            sub_type = self.config['services']['gemini'].get('subscription_type')
+            if sub_type:
+                return sub_type
+            elif self.config['services']['gemini']['billing_enabled']:
+                return 'paid'
+        return 'free'  # Default
+    
+    def detect_plan(self):
+        """Legacy method for compatibility"""
+        return self.detect_claude_plan()
+        
+    def get_model_type(self, model_name):
+        """Determine model type from name"""
+        if not model_name:
+            return 'sonnet'
+            
+        model_lower = model_name.lower()
+        
+        # Claude models
+        if 'opus' in model_lower:
+            return 'opus'
+        elif 'haiku' in model_lower:
+            return 'haiku'
+        elif 'sonnet' in model_lower:
+            return 'sonnet'
+            
+        # Gemini models
+        elif 'gemini' in model_lower:
+            if '2.5-pro' in model_lower:
+                return 'gemini-2.5-pro'
+            elif '2.5-flash' in model_lower:
+                return 'gemini-2.5-flash'
+            elif '2.0-flash' in model_lower:
+                return 'gemini-2.0-flash'
+            elif '1.5-pro' in model_lower:
+                return 'gemini-1.5-pro'
+            elif '1.5-flash' in model_lower:
+                return 'gemini-1.5-flash'
+            else:
+                return 'gemini-2.5-pro'  # Default Gemini
+                
+        return 'sonnet'  # Default
+            
+    def get_model_weight(self, model_name):
+        """Get resource weight for a model"""
+        model_type = self.get_model_type(model_name)
+        return self.model_weights.get(model_type, 1.0)
+        
+    def get_session_window(self):
+        """Get current 5-hour session window for Claude based on first message after gap"""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        
+        # Collect all user message timestamps
+        all_timestamps = []
+        for project_dir in self.claude_dir.iterdir():
+            if project_dir.is_dir():
+                for jsonl_file in project_dir.glob('*.jsonl'):
+                    try:
+                        with open(jsonl_file, 'r') as f:
+                            for line in f:
+                                if not line.strip():
+                                    continue
+                                try:
+                                    entry = json.loads(line)
+                                    if 'timestamp' in entry and entry.get('type') == 'user':
+                                        msg_time = datetime.fromisoformat(entry['timestamp'].replace('Z', '+00:00'))
+                                        if msg_time.tzinfo:
+                                            msg_time = msg_time.replace(tzinfo=None)
+                                        # Round down to nearest hour before adding to list
+                                        msg_time_rounded = msg_time.replace(minute=0, second=0, microsecond=0)
+                                        all_timestamps.append(msg_time_rounded)
+                                except json.JSONDecodeError:
+                                    continue
+                    except:
+                        continue
+        
+        if all_timestamps:
+            # Remove duplicates and sort timestamps chronologically
+            all_timestamps = sorted(set(all_timestamps))
+            
+            # Find the most recent message after a gap of more than 1 hour
+            session_start_time = None
+            
+            # Work forward through timestamps to find the last gap > 1 hour
+            for i in range(1, len(all_timestamps)):
+                current_time = all_timestamps[i]
+                previous_time = all_timestamps[i - 1]
+                
+                # Check if there's a gap of more than 1 hour (timestamps are already rounded to hours)
+                gap_hours = (current_time - previous_time).total_seconds() / 3600
+                if gap_hours > 1.0:
+                    # The current message is after a gap - this could be our session start
+                    session_start_time = current_time
+            
+            # If no gap found, use the first message overall
+            if session_start_time is None:
+                session_start_time = all_timestamps[0]
+            
+            # Timestamps are already rounded to the nearest hour
+            session_start = session_start_time
+            session_end = session_start + timedelta(hours=5)
+            
+            # If the current session has expired, find the next session
+            while now >= session_end:
+                # Look for the next message after this session ended
+                next_session_start = None
+                for timestamp in all_timestamps:
+                    if timestamp >= session_end:
+                        next_session_start = timestamp
+                        break
+                
+                if next_session_start:
+                    session_start = next_session_start
+                    session_end = session_start + timedelta(hours=5)
+                else:
+                    # No more messages, break out of loop
+                    break
+        else:
+            # Fallback to fixed blocks if no messages found
+            hour = (now.hour // 5) * 5
+            session_start = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+            session_end = session_start + timedelta(hours=5)
+            
+            # Handle the overnight window (20:00-01:00 next day)
+            if hour == 20:
+                session_end = session_start.replace(hour=1, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        
+        return session_start, session_end
+    
+    def get_daily_window(self):
+        """Get current daily window for Gemini"""
+        now = datetime.now()
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        return day_start, day_end
+        
+    def analyze_sessions(self):
+        """Analyze all sessions in current window"""
+        session_start, session_end = self.get_session_window()
+        
+        data = {
+            'session_start': session_start,
+            'session_end': session_end,
+            'messages_by_model': defaultdict(int),
+            'resource_units_by_model': defaultdict(float),
+            'messages_by_type': defaultdict(int),
+            'resource_units_by_type': defaultdict(float),
+            'token_stats': {
+                'input': 0,
+                'output': 0,
+                'cache_create': 0,
+                'cache_read': 0,
+                'total_weighted': 0
+            },
+            'gemini_tokens': {
+                'input': 0,
+                'output': 0,
+                'cached': 0
+            },
+            'total_messages': 0,
+            'total_resource_units': 0,
+            'files_analyzed': 0,
+            'sessions': [],
+            'recent_activity': [],
+            'services_active': []
+        }
+        
+        # Analyze Claude sessions
+        if 'claude' in self.services_found and (not self.service or self.service == 'claude'):
+            for project_dir in self.claude_dir.iterdir():
+                if project_dir.is_dir():
+                    for jsonl_file in project_dir.glob('*.jsonl'):
+                        mtime = datetime.fromtimestamp(jsonl_file.stat().st_mtime).astimezone(timezone.utc).replace(tzinfo=None)
+                        
+                        if session_start <= mtime <= session_end:
+                            data['files_analyzed'] += 1
+                            data['sessions'].append({
+                                'file': jsonl_file.name,
+                                'project': project_dir.name,
+                                'modified': mtime,
+                                'service': 'claude'
+                            })
+                            self.analyze_claude_file(jsonl_file, data)
+                            if 'claude' not in data['services_active']:
+                                data['services_active'].append('claude')
+                                
+        # Analyze Gemini sessions
+        if 'gemini' in self.services_found and (not self.service or self.service == 'gemini'):
+            day_start, day_end = self.get_daily_window()
+            for project_dir in self.gemini_dir.iterdir():
+                if project_dir.is_dir():
+                    logs_file = project_dir / 'logs.json'
+                    if logs_file.exists():
+                        mtime = datetime.fromtimestamp(logs_file.stat().st_mtime)
+                        
+                        if day_start <= mtime <= day_end:
+                            data['files_analyzed'] += 1
+                            data['sessions'].append({
+                                'file': logs_file.name,
+                                'project': project_dir.name,
+                                'modified': mtime,
+                                'service': 'gemini'
+                            })
+                            self.analyze_gemini_file(logs_file, data)
+                            if 'gemini' not in data['services_active']:
+                                data['services_active'].append('gemini')
+                        
+        # Calculate weighted token total (cache reads are free for Pro/Max)
+        data['token_stats']['total_weighted'] = (
+            data['token_stats']['input'] + 
+            (data['token_stats']['output'] * 10) +
+            data['token_stats']['cache_create']
+        )
+        
+        # Sort recent activity by time
+        data['recent_activity'].sort(key=lambda x: x['timestamp'], reverse=True)
+        
+        return data
+        
+    def analyze_claude_file(self, jsonl_file, data):
+        """Analyze a single session file"""
+        last_model = None
+        session_start, session_end = self.get_session_window()
+        
+        try:
+            with open(jsonl_file, 'r') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                        
+                    try:
+                        entry = json.loads(line)
+                        
+                        # Check if message is within session window
+                        if 'timestamp' in entry:
+                            try:
+                                msg_time = datetime.fromisoformat(entry['timestamp'].replace('Z', '+00:00'))
+                                if msg_time.tzinfo:
+                                    msg_time = msg_time.replace(tzinfo=None)
+                                
+                                if not (session_start <= msg_time <= session_end):
+                                    continue
+                            except:
+                                pass
+                        
+                        # Track model from assistant messages
+                        if entry.get('type') == 'assistant' and 'message' in entry:
+                            msg = entry['message']
+                            if 'model' in msg:
+                                last_model = msg['model']
+                                
+                            # Track token usage
+                            if 'usage' in msg:
+                                usage = msg['usage']
+                                data['token_stats']['input'] += usage.get('input_tokens', 0)
+                                data['token_stats']['output'] += usage.get('output_tokens', 0)
+                                data['token_stats']['cache_create'] += usage.get('cache_creation_input_tokens', 0)
+                                data['token_stats']['cache_read'] += usage.get('cache_read_input_tokens', 0)
+                        
+                        # Count user messages
+                        elif entry.get('type') == 'user':
+                            if 'message' in entry and 'content' in entry['message']:
+                                content = entry['message']['content']
+                                
+                                # Skip tool results
+                                if isinstance(content, list) and all(
+                                    'tool_use_id' in item for item in content 
+                                    if isinstance(item, dict)
+                                ):
+                                    continue
+                                    
+                                # Track message
+                                model_key = last_model or 'unknown'
+                                model_type = self.get_model_type(last_model)
+                                weight = self.get_model_weight(last_model)
+                                
+                                data['messages_by_model'][model_key] += 1
+                                data['resource_units_by_model'][model_key] += weight
+                                data['messages_by_type'][model_type] += 1
+                                data['resource_units_by_type'][model_type] += weight
+                                data['total_messages'] += 1
+                                data['total_resource_units'] += weight
+                                
+                                # Track recent activity
+                                if 'timestamp' in entry:
+                                    try:
+                                        msg_time = datetime.fromisoformat(entry['timestamp'].replace('Z', '+00:00'))
+                                        if msg_time.tzinfo:
+                                            msg_time = msg_time.replace(tzinfo=None)
+                                        data['recent_activity'].append({
+                                            'timestamp': entry['timestamp'],
+                                            'model': model_type,
+                                            'weight': weight,
+                                            'project': jsonl_file.parent.name
+                                        })
+                                    except:
+                                        pass
+                                
+                    except json.JSONDecodeError:
+                        continue
+                        
+        except Exception:
+            pass
+            
+    def analyze_gemini_file(self, logs_file, data):
+        """Analyze a Gemini logs.json file"""
+        day_start, day_end = self.get_daily_window()
+        
+        try:
+            with open(logs_file, 'r') as f:
+                logs_data = json.load(f)
+                
+            # Gemini logs can be either a flat array or have sessions
+            messages = []
+            if isinstance(logs_data, list):
+                # Flat array of messages
+                messages = logs_data
+            elif isinstance(logs_data, dict) and 'sessions' in logs_data:
+                # Sessions structure
+                for session in logs_data['sessions']:
+                    if 'messages' in session:
+                        messages.extend(session['messages'])
+            
+            for message in messages:
+                # Check if message is within session window
+                if 'timestamp' in message:
+                    try:
+                        msg_time = datetime.fromisoformat(message['timestamp'].replace('Z', '+00:00'))
+                        if msg_time.tzinfo:
+                            msg_time = msg_time.replace(tzinfo=None)
+                        if not (day_start <= msg_time <= day_end):
+                            continue
+                    except:
+                        pass
+                
+                # Look for user messages
+                if message.get('type') == 'user':
+                    # Default to Gemini 2.5 Pro if not specified
+                    model_name = message.get('model', 'gemini-2.5-pro')
+                    model_type = self.get_model_type(model_name)
+                    weight = self.get_model_weight(model_name)
+                    
+                    data['messages_by_model'][model_name] += 1
+                    data['resource_units_by_model'][model_name] += weight
+                    data['messages_by_type'][model_type] += 1
+                    data['resource_units_by_type'][model_type] += weight
+                    data['total_messages'] += 1
+                    data['total_resource_units'] += weight
+                    
+                    # Track recent activity
+                    if 'timestamp' in message:
+                        data['recent_activity'].append({
+                            'timestamp': message['timestamp'],
+                            'model': model_type,
+                            'weight': weight,
+                            'project': logs_file.parent.name,
+                            'service': 'gemini'
+                        })
+                        
+                # Track token usage if available
+                elif message.get('type') == 'assistant' and 'usage' in message:
+                    usage = message['usage']
+                    data['gemini_tokens']['input'] += usage.get('prompt_tokens', 0)
+                    data['gemini_tokens']['output'] += usage.get('completion_tokens', 0)
+                    # Check for cached tokens
+                    if 'cached_tokens' in usage:
+                        data['gemini_tokens']['cached'] += usage.get('cached_tokens', 0)
+                                
+        except Exception:
+            pass
+            
+    def calculate_costs(self, data):
+        """Calculate projected API costs based on usage"""
+        costs = {
+            'claude': {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0, 'total': 0},
+            'gemini': {'input': 0, 'output': 0, 'total': 0},
+            'total': 0
+        }
+        
+        if not self.config['preferences']['show_cost_projections']:
+            return costs
+            
+        # Claude costs - use actual token counts
+        if 'claude' in data.get('services_active', []) and data['token_stats']['input'] > 0:
+            # Claude uses different pricing per model, so we need to estimate distribution
+            # Get the dominant model based on message count
+            dominant_model = 'sonnet'  # default
+            max_count = 0
+            for model_type in ['opus', 'sonnet', 'haiku']:
+                count = data['messages_by_type'].get(model_type, 0)
+                if count > max_count:
+                    max_count = count
+                    dominant_model = model_type
+            
+            # Map to actual model names for pricing
+            model_map = {
+                'opus': 'claude-3-opus-20240229',
+                'sonnet': 'claude-3-5-sonnet-20241022',
+                'haiku': 'claude-3-5-haiku-20241022'
+            }
+            
+            model_name = model_map.get(dominant_model, 'claude-3-5-sonnet-20241022')
+            
+            # Get prices
+            input_price = self.config_manager.get_api_price('claude', model_name, 'input')
+            output_price = self.config_manager.get_api_price('claude', model_name, 'output')
+            
+            # Calculate costs using actual tokens
+            costs['claude']['input'] = (data['token_stats']['input'] * input_price) / 1_000_000
+            costs['claude']['output'] = (data['token_stats']['output'] * output_price) / 1_000_000
+            
+            # Cache costs (cache write costs same as input, cache read is typically 10% of input cost)
+            costs['claude']['cache_write'] = (data['token_stats']['cache_create'] * input_price) / 1_000_000
+            costs['claude']['cache_read'] = (data['token_stats']['cache_read'] * input_price * 0.1) / 1_000_000
+            
+            costs['claude']['total'] = (costs['claude']['input'] + costs['claude']['output'] + 
+                                       costs['claude']['cache_write'] + costs['claude']['cache_read'])
+            
+        # Gemini costs
+        if 'gemini' in data.get('services_active', []):
+            # If we have token data for Gemini, use it
+            if 'gemini_tokens' in data and data['gemini_tokens']['input'] > 0:
+                # Get the dominant Gemini model
+                dominant_model = 'gemini-2.5-pro'
+                max_count = 0
+                for model in ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash']:
+                    count = data['messages_by_type'].get(model, 0)
+                    if count > max_count:
+                        max_count = count
+                        dominant_model = model
+                
+                input_price = self.config_manager.get_api_price('gemini', dominant_model, 'input')
+                output_price = self.config_manager.get_api_price('gemini', dominant_model, 'output')
+                
+                # Gemini cached tokens are free (already deducted from input)
+                actual_input = data['gemini_tokens']['input'] - data['gemini_tokens'].get('cached', 0)
+                
+                costs['gemini']['input'] = (actual_input * input_price) / 1_000_000
+                costs['gemini']['output'] = (data['gemini_tokens']['output'] * output_price) / 1_000_000
+            else:
+                # Fallback to estimates
+                for model, count in data['messages_by_model'].items():
+                    if 'gemini' in model.lower():
+                        avg_input = 1000
+                        avg_output = 500
+                        
+                        input_cost = self.config_manager.get_api_price('gemini', model, 'input')
+                        output_cost = self.config_manager.get_api_price('gemini', model, 'output')
+                        
+                        costs['gemini']['input'] += (count * avg_input * input_cost) / 1_000_000
+                        costs['gemini']['output'] += (count * avg_output * output_cost) / 1_000_000
+                        
+            costs['gemini']['total'] = costs['gemini']['input'] + costs['gemini']['output']
+            
+        costs['total'] = costs['claude']['total'] + costs['gemini']['total']
+        return costs
+            
+    def format_time_remaining(self, minutes):
+        """Format time remaining in human-readable format"""
+        if minutes <= 0:
+            return "Session expired"
+        hours = int(minutes // 60)
+        mins = int(minutes % 60)
+        return f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
+        
+    def format_session_time(self, utc_time):
+        """Format session time according to user's timezone preference"""
+        # Default to local time if setting doesn't exist (backward compatibility)
+        timezone_display = self.config['preferences'].get('timezone_display', 'local')
+        
+        if timezone_display == 'utc':
+            return utc_time.strftime('%H:%M') + ' UTC'
+        else:
+            local_time = utc_time.replace(tzinfo=timezone.utc).astimezone()
+            return local_time.strftime('%H:%M')
+        
+    def draw_dashboard(self, stdscr):
+        """Draw interactive dashboard with separated service sections"""
+        curses.curs_set(0)
+        stdscr.nodelay(1)
+        
+        # Define colors
+        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
+        curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        curses.init_pair(6, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+        
+        while True:
+            stdscr.clear()
+            height, width = stdscr.getmaxyx()
+            
+            # Get fresh data
+            data = self.analyze_sessions()
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            
+            # Calculate API costs
+            costs = self.calculate_costs(data) if self.config['preferences']['show_cost_projections'] else {'claude': {'total': 0}, 'gemini': {'total': 0}}
+            
+            # Header
+            services_str = "/".join([s.upper() for s in self.services_found]) if self.services_found else "CLAUDE"
+            header = f"⚡ MONITORMV v{__version__} - {services_str} ⚡"
+            stdscr.addstr(0, max(0, (width - len(header)) // 2), header[:width], curses.color_pair(4) | curses.A_BOLD)
+            
+            # Analyzed sessions info
+            y = 2
+            session_info = f"Analyzed {data['files_analyzed']} sessions"
+            stdscr.addstr(y, 2, session_info[:width-4], curses.color_pair(5))
+            y += 1
+            
+            # Calculate service-specific stats
+            claude_units = sum(data['resource_units_by_type'].get(m, 0) for m in ['opus', 'sonnet', 'haiku'])
+            claude_msgs = sum(data['messages_by_type'].get(m, 0) for m in ['opus', 'sonnet', 'haiku'])
+            
+            gemini_msgs = sum(data['messages_by_type'].get(m, 0) for m in 
+                            ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 
+                             'gemini-1.5-pro', 'gemini-1.5-flash'])
+            
+            # CLAUDE AI SERVICES SECTION
+            if 'claude' in self.services_found and y < height - 15:
+                y += 1
+                # Section header
+                separator = "=" * min(60, width - 4)
+                stdscr.addstr(y, 2, separator[:width-4], curses.color_pair(4))
+                y += 1
+                stdscr.addstr(y, 2, "📘 CLAUDE AI SERVICES", curses.color_pair(4) | curses.A_BOLD)
+                y += 1
+                stdscr.addstr(y, 2, separator[:width-4], curses.color_pair(4))
+                y += 1
+                
+                if claude_msgs > 0:
+                    # Time window info
+                    time_remaining = (data['session_end'] - now).total_seconds() / 60
+                    # Format session times according to user preference
+                    session_start_fmt = self.format_session_time(data['session_start'])
+                    session_end_fmt = self.format_session_time(data['session_end'])
+                    info_line = f"Session: {session_start_fmt} - {session_end_fmt} | Resets in: {self.format_time_remaining(time_remaining)} | Plan: {self.plan.upper()}"
+                    stdscr.addstr(y, 2, info_line[:width-4], curses.color_pair(5))
+                    y += 2
+                    
+                    # Claude Resource Usage
+                    stdscr.addstr(y, 2, "RESOURCE USAGE:", curses.A_BOLD)
+                    y += 1
+                    
+                    claude_pct = min((claude_units / self.base_limit) * 100, 100) if self.base_limit != float('inf') else 0
+                    bar_width = min(40, width - 25)
+                    filled = int(bar_width * claude_pct / 100)
+                    bar = "█" * filled + "░" * (bar_width - filled)
+                    
+                    color = curses.color_pair(1 if claude_pct < 50 else 2 if claude_pct < 80 else 3)
+                    indicator = "🟢" if claude_pct < 50 else "🟡" if claude_pct < 80 else "🔴"
+                    stdscr.addstr(y, 2, f"{indicator} [{bar}] {claude_pct:.1f}%", color)
+                    y += 1
+                    stdscr.addstr(y, 4, f"{claude_units:.1f} / {self.base_limit} units ({claude_msgs} messages)", curses.color_pair(5))
+                    y += 2
+                    
+                    # Claude Model Breakdown
+                    stdscr.addstr(y, 2, "MODEL BREAKDOWN:", curses.A_BOLD)
+                    y += 1
+                    for model_type in ['opus', 'sonnet', 'haiku']:
+                        count = data['messages_by_type'].get(model_type, 0)
+                        units = data['resource_units_by_type'].get(model_type, 0)
+                        if count > 0 and y < height - 10:
+                            emoji = "🔴" if model_type == 'opus' else "🟡" if model_type == 'sonnet' else "🟢"
+                            line = f"{emoji} {model_type.capitalize()}: {count} messages = {units:.1f} units"
+                            stdscr.addstr(y, 4, line[:width-6], curses.color_pair(5))
+                            y += 1
+                    y += 1
+                    
+                    # Claude Token Usage
+                    if y < height - 8:
+                        stdscr.addstr(y, 2, "TOKEN USAGE:", curses.A_BOLD)
+                        y += 1
+                        stdscr.addstr(y, 4, f"Input: {data['token_stats']['input']:,}", curses.color_pair(5))
+                        y += 1
+                        stdscr.addstr(y, 4, f"Output: {data['token_stats']['output']:,} (×10 weight)", curses.color_pair(5))
+                        y += 1
+                        stdscr.addstr(y, 4, f"Cache: {data['token_stats']['cache_create']:,} created, {data['token_stats']['cache_read']:,} read (free)", curses.color_pair(5))
+                        y += 2
+                    
+                    # Claude API Cost Projection
+                    if self.config['preferences']['show_cost_projections'] and costs['claude']['total'] > 0 and y < height - 6:
+                        stdscr.addstr(y, 2, "API COST PROJECTION:", curses.A_BOLD)
+                        y += 1
+                        breakdown_parts = []
+                        if costs['claude']['input'] > 0:
+                            breakdown_parts.append(f"Input: ${costs['claude']['input']:.2f}")
+                        if costs['claude']['output'] > 0:
+                            breakdown_parts.append(f"Output: ${costs['claude']['output']:.2f}")
+                        if costs['claude']['cache_write'] > 0:
+                            breakdown_parts.append(f"Cache Write: ${costs['claude']['cache_write']:.2f}")
+                        if costs['claude']['cache_read'] > 0:
+                            breakdown_parts.append(f"Cache Read: ${costs['claude']['cache_read']:.2f}")
+                        cost_str = f"${costs['claude']['total']:.2f} ({', '.join(breakdown_parts)})"
+                        stdscr.addstr(y, 4, cost_str[:width-6], curses.color_pair(5))
+                        y += 1
+                else:
+                    stdscr.addstr(y, 2, "No Claude usage in current session", curses.color_pair(5))
+                    y += 1
+            
+            # GEMINI AI SERVICES SECTION
+            if 'gemini' in self.services_found and y < height - 10:
+                y += 1
+                # Section header
+                separator = "=" * min(60, width - 4)
+                stdscr.addstr(y, 2, separator[:width-4], curses.color_pair(6))
+                y += 1
+                stdscr.addstr(y, 2, "💎 GEMINI AI SERVICES", curses.color_pair(6) | curses.A_BOLD)
+                y += 1
+                stdscr.addstr(y, 2, separator[:width-4], curses.color_pair(6))
+                y += 1
+                
+                if gemini_msgs > 0:
+                    # Time window info
+                    day_start, day_end = self.get_daily_window()
+                    time_remaining = (day_end - now).total_seconds() / 60
+                    info_line = f"Daily usage (resets in {self.format_time_remaining(time_remaining)}) | Plan: {self.gemini_plan.upper()}"
+                    stdscr.addstr(y, 2, info_line[:width-4], curses.color_pair(5))
+                    y += 2
+                    
+                    # Gemini Resource Usage
+                    stdscr.addstr(y, 2, "RESOURCE USAGE:", curses.A_BOLD)
+                    y += 1
+                    
+                    if self.gemini_plan != 'api':
+                        # Updated Gemini limits based on research
+                        # Free tier: 15 RPM, 2M TPM, 1500 RPD
+                        # Paid tier: 360 RPM, 4M TPM, 30000 RPD
+                        gemini_daily_limit = 1500 if self.gemini_plan == 'free' else 30000
+                        gemini_pct = min((gemini_msgs / gemini_daily_limit) * 100, 100)
+                        bar_width = min(40, width - 25)
+                        filled = int(bar_width * gemini_pct / 100)
+                        bar = "█" * filled + "░" * (bar_width - filled)
+                        
+                        color = curses.color_pair(1 if gemini_pct < 50 else 2 if gemini_pct < 80 else 3)
+                        indicator = "🟢" if gemini_pct < 50 else "🟡" if gemini_pct < 80 else "🔴"
+                        stdscr.addstr(y, 2, f"{indicator} [{bar}] {gemini_pct:.1f}%", color)
+                        y += 1
+                        stdscr.addstr(y, 4, f"{gemini_msgs} / {gemini_daily_limit} daily requests", curses.color_pair(5))
+                    else:
+                        stdscr.addstr(y, 2, f"🟢 {gemini_msgs} requests (API - no limit)", curses.color_pair(1))
+                    y += 2
+                    
+                    # Gemini Model Breakdown
+                    if y < height - 6:
+                        stdscr.addstr(y, 2, "MODEL BREAKDOWN:", curses.A_BOLD)
+                        y += 1
+                        gemini_models = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
+                        for model_type in gemini_models:
+                            count = data['messages_by_type'].get(model_type, 0)
+                            if count > 0 and y < height - 5:
+                                emoji = "💎" if 'pro' in model_type else "⚡"
+                                model_display = model_type.replace('gemini-', '').replace('-', ' ').title()
+                                line = f"{emoji} {model_display}: {count} messages"
+                                stdscr.addstr(y, 4, line[:width-6], curses.color_pair(5))
+                                y += 1
+                        y += 1
+                    
+                    # Gemini Token Usage
+                    if y < height - 4:
+                        stdscr.addstr(y, 2, "TOKEN USAGE:", curses.A_BOLD)
+                        y += 1
+                        if 'gemini_tokens' in data and data['gemini_tokens']['input'] > 0:
+                            stdscr.addstr(y, 4, f"Input: {data['gemini_tokens']['input']:,}", curses.color_pair(5))
+                            y += 1
+                            stdscr.addstr(y, 4, f"Output: {data['gemini_tokens']['output']:,}", curses.color_pair(5))
+                            y += 1
+                            if data['gemini_tokens'].get('cached', 0) > 0:
+                                stdscr.addstr(y, 4, f"Cache: {data['gemini_tokens']['cached']:,} (saved from input)", curses.color_pair(5))
+                                y += 1
+                        else:
+                            stdscr.addstr(y, 4, "Token tracking data not found in logs", curses.color_pair(5))
+                            y += 1
+                        y += 1
+                    
+                    # Gemini API Cost Projection
+                    if self.config['preferences']['show_cost_projections'] and y < height - 3:
+                        if costs['gemini']['total'] > 0:
+                            stdscr.addstr(y, 2, "API COST PROJECTION:", curses.A_BOLD)
+                            y += 1
+                            breakdown_parts = []
+                            if costs['gemini']['input'] > 0:
+                                breakdown_parts.append(f"Input: ${costs['gemini']['input']:.2f}")
+                            if costs['gemini']['output'] > 0:
+                                breakdown_parts.append(f"Output: ${costs['gemini']['output']:.2f}")
+                            cost_str = f"${costs['gemini']['total']:.2f}"
+                            if breakdown_parts:
+                                cost_str += f" ({', '.join(breakdown_parts)})"
+                            stdscr.addstr(y, 4, cost_str[:width-6], curses.color_pair(5))
+                            y += 1
+                else:
+                    stdscr.addstr(y, 2, "No Gemini usage today", curses.color_pair(5))
+                    y += 1
+                    
+            # Footer
+            y = height - 2
+            footer = f"Press 'q' to quit | 'r' to refresh | Updates every 5s"
+            stdscr.addstr(y, 2, footer[:width-4], curses.color_pair(5))
+            
+            stdscr.refresh()
+            
+            # Handle input
+            key = stdscr.getch()
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                continue
+                
+            time.sleep(5)
+            
+    def run_simple(self):
+        """Simple text mode"""
+        # Use ANSI escape sequences for smoother updates
+        print('\033[?25l', end='')  # Hide cursor
+        try:
+            while True:
+                try:
+                    # Clear screen using ANSI escape sequences
+                    print('\033[2J\033[H', end='', flush=True)
+                    data = self.analyze_sessions()
+                
+                    # Header
+                    services_str = "/".join([s.upper() for s in self.services_found]) if self.services_found else "CLAUDE"
+                    print(f"\n⚡ MONITORMV v{__version__} - {services_str} - {self.plan.upper()} PLAN")
+                    print("=" * 60)
+                    
+                    # Session info
+                    now = datetime.now(timezone.utc).replace(tzinfo=None)
+                    if 'claude' in self.services_found and 'gemini' in self.services_found:
+                        # Show both windows
+                        claude_remaining = (data['session_end'] - now).total_seconds() / 60
+                        day_start, day_end = self.get_daily_window()
+                        gemini_remaining = (day_end - now).total_seconds() / 60
+                        # Format session times according to user preference
+                        session_start_fmt = self.format_session_time(data['session_start'])
+                        session_end_fmt = self.format_session_time(data['session_end'])
+                        print(f"Claude window: {session_start_fmt} - {session_end_fmt} (resets in {self.format_time_remaining(claude_remaining)})")
+                        print(f"Gemini window: Today (resets in {self.format_time_remaining(gemini_remaining)})")
+                    elif 'claude' in self.services_found:
+                        time_remaining = (data['session_end'] - now).total_seconds() / 60
+                        # Format session times according to user preference
+                        session_start_fmt = self.format_session_time(data['session_start'])
+                        session_end_fmt = self.format_session_time(data['session_end'])
+                        print(f"Session: {session_start_fmt} - {session_end_fmt} (resets in {self.format_time_remaining(time_remaining)})")
+                    else:
+                        day_start, day_end = self.get_daily_window()
+                        time_remaining = (day_end - now).total_seconds() / 60
+                        print(f"Daily usage (resets in {self.format_time_remaining(time_remaining)})")
+                    print(f"Active sessions: {data['files_analyzed']}")
+                    
+                    # Separate Claude and Gemini usage
+                    claude_units = sum(data['resource_units_by_type'].get(m, 0) for m in ['opus', 'sonnet', 'haiku'])
+                    claude_msgs = sum(data['messages_by_type'].get(m, 0) for m in ['opus', 'sonnet', 'haiku'])
+                    
+                    gemini_units = sum(data['resource_units_by_type'].get(m, 0) for m in 
+                                     ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 
+                                      'gemini-1.5-pro', 'gemini-1.5-flash'])
+                    gemini_msgs = sum(data['messages_by_type'].get(m, 0) for m in 
+                                    ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 
+                                     'gemini-1.5-pro', 'gemini-1.5-flash'])
+                    
+                    # Calculate costs once for both sections
+                    if self.config['preferences']['show_cost_projections']:
+                        costs = self.calculate_costs(data)
+                    else:
+                        costs = {'claude': {'total': 0}, 'gemini': {'total': 0}, 'total': 0}
+                    
+                    # CLAUDE AI SERVICES SECTION
+                    if 'claude' in self.services_found:
+                        print(f"\n{'='*60}")
+                        print("📘 CLAUDE AI SERVICES")
+                        print(f"{'='*60}")
+                        
+                        # Claude Resource Usage
+                        if claude_msgs > 0:
+                            claude_pct = min((claude_units / self.base_limit) * 100, 100) if self.base_limit != float('inf') else 0
+                            bar_width = 40
+                            filled = int(bar_width * claude_pct / 100)
+                            bar = "█" * filled + "░" * (bar_width - filled)
+                            
+                            emoji = "🟢" if claude_pct < 50 else "🟡" if claude_pct < 80 else "🔴"
+                            print(f"\nRESOURCE USAGE:")
+                            print(f"{emoji} [{bar}] {claude_pct:.1f}%")
+                            print(f"   {claude_units:.1f} / {self.base_limit} units ({claude_msgs} messages)")
+                            
+                            # Claude Model Breakdown
+                            print(f"\nMODEL BREAKDOWN:")
+                            for model_type in ['opus', 'sonnet', 'haiku']:
+                                count = data['messages_by_type'].get(model_type, 0)
+                                units = data['resource_units_by_type'].get(model_type, 0)
+                                if count > 0:
+                                    emoji = "🔴" if model_type == 'opus' else "🟡" if model_type == 'sonnet' else "🟢"
+                                    print(f"   {emoji} {model_type.capitalize()}: {count} messages = {units:.1f} units")
+                            
+                            # Claude Token Usage
+                            print(f"\nTOKEN USAGE:")
+                            print(f"   Input: {data['token_stats']['input']:,}")
+                            print(f"   Output: {data['token_stats']['output']:,} (×10 weight)")
+                            print(f"   Cache: {data['token_stats']['cache_create']:,} created, {data['token_stats']['cache_read']:,} read (free)")
+                            
+                            # Claude API Cost Projection
+                            if self.config['preferences']['show_cost_projections'] and costs['claude']['total'] > 0:
+                                print(f"\nAPI COST PROJECTION:")
+                                breakdown_parts = []
+                                if costs['claude']['input'] > 0:
+                                    breakdown_parts.append(f"Input: ${costs['claude']['input']:.2f}")
+                                if costs['claude']['output'] > 0:
+                                    breakdown_parts.append(f"Output: ${costs['claude']['output']:.2f}")
+                                if costs['claude']['cache_write'] > 0:
+                                    breakdown_parts.append(f"Cache Write: ${costs['claude']['cache_write']:.2f}")
+                                if costs['claude']['cache_read'] > 0:
+                                    breakdown_parts.append(f"Cache Read: ${costs['claude']['cache_read']:.2f}")
+                                print(f"   ${costs['claude']['total']:.2f} ({', '.join(breakdown_parts)})")
+                        else:
+                            print("\nNo Claude usage in current session")
+                    
+                    # GEMINI AI SERVICES SECTION
+                    if 'gemini' in self.services_found:
+                        print(f"\n{'='*60}")
+                        print("💎 GEMINI AI SERVICES")
+                        print(f"{'='*60}")
+                        
+                        # Gemini Resource Usage
+                        if gemini_msgs > 0:
+                            gemini_limit = self.gemini_limits.get(self.gemini_plan, 1500)  # Already in daily units
+                            if self.gemini_plan != 'api':
+                                gemini_pct = min((gemini_msgs / gemini_limit) * 100, 100)
+                                bar_width = 40
+                                filled = int(bar_width * gemini_pct / 100)
+                                bar = "█" * filled + "░" * (bar_width - filled)
+                                
+                                emoji = "🟢" if gemini_pct < 50 else "🟡" if gemini_pct < 80 else "🔴"
+                                print(f"\nRESOURCE USAGE:")
+                                print(f"{emoji} [{bar}] {gemini_pct:.1f}%")
+                                print(f"   {gemini_msgs} / {gemini_limit} daily requests")
+                            else:
+                                print(f"\nRESOURCE USAGE:")
+                                print(f"   {gemini_msgs} requests (API - no limit)")
+                            
+                            # Gemini Model Breakdown
+                            print(f"\nMODEL BREAKDOWN:")
+                            gemini_models = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
+                            for model_type in gemini_models:
+                                count = data['messages_by_type'].get(model_type, 0)
+                                if count > 0:
+                                    emoji = "💎" if 'pro' in model_type else "⚡"
+                                    model_display = model_type.replace('gemini-', '').replace('-', ' ').title()
+                                    print(f"   {emoji} {model_display}: {count} messages")
+                            
+                            # Gemini Token Usage
+                            print(f"\nTOKEN USAGE:")
+                            if 'gemini_tokens' in data and data['gemini_tokens']['input'] > 0:
+                                print(f"   Input: {data['gemini_tokens']['input']:,}")
+                                print(f"   Output: {data['gemini_tokens']['output']:,}")
+                                if data['gemini_tokens'].get('cached', 0) > 0:
+                                    print(f"   Cache: {data['gemini_tokens']['cached']:,} (saved from input)")
+                            else:
+                                print(f"   Token tracking data not found in logs")
+                            
+                            # Gemini API Cost Projection
+                            if self.config['preferences']['show_cost_projections']:
+                                if costs['gemini']['total'] > 0:
+                                    print(f"\nAPI COST PROJECTION:")
+                                    breakdown_parts = []
+                                    if costs['gemini']['input'] > 0:
+                                        breakdown_parts.append(f"Input: ${costs['gemini']['input']:.2f}")
+                                    if costs['gemini']['output'] > 0:
+                                        breakdown_parts.append(f"Output: ${costs['gemini']['output']:.2f}")
+                                    cost_str = f"${costs['gemini']['total']:.2f}"
+                                    if breakdown_parts:
+                                        cost_str += f" ({', '.join(breakdown_parts)})"
+                                    print(f"   {cost_str}")
+                        else:
+                            print("\nNo Gemini usage today")
+                    
+                    print("\n[Updates every 5s | Press Ctrl+C to exit]")
+                    
+                    time.sleep(5)
+                
+                except KeyboardInterrupt:
+                    break
+        finally:
+            print('\033[?25h', end='')  # Show cursor
+            print("\n\nExiting...")
+                
+    def run_once(self):
+        """Run once and display results"""
+        data = self.analyze_sessions()
+        
+        # Session info
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        
+        # Header
+        services_str = "/".join([s.upper() for s in self.services_found]) if self.services_found else "CLAUDE"
+        print(f"\nMonitorMV v{__version__} - {services_str}")
+        print("Part of the Mea Vita AI Development Suite")
+        print(f"\nAnalyzed {data['files_analyzed']} sessions")
+        
+        # Calculate API costs
+        costs = self.calculate_costs(data)
+        
+        # Get Claude usage stats
+        claude_units = sum(data['resource_units_by_type'].get(m, 0) for m in ['opus', 'sonnet', 'haiku'])
+        claude_msgs = sum(data['messages_by_type'].get(m, 0) for m in ['opus', 'sonnet', 'haiku'])
+        
+        # Get Gemini usage stats
+        gemini_msgs = sum(data['messages_by_type'].get(m, 0) for m in 
+                        ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 
+                         'gemini-1.5-pro', 'gemini-1.5-flash'])
+        
+        # CLAUDE AI SERVICES SECTION
+        if 'claude' in self.services_found:
+            print(f"\n{'='*60}")
+            print("📘 CLAUDE AI SERVICES")
+            print(f"{'='*60}")
+            
+            if claude_msgs > 0:
+                # Time window info
+                time_remaining = (data['session_end'] - now).total_seconds() / 60
+                # Format session times according to user preference
+                session_start_fmt = self.format_session_time(data['session_start'])
+                session_end_fmt = self.format_session_time(data['session_end'])
+                print(f"\nSession: {session_start_fmt} - {session_end_fmt} (resets in {self.format_time_remaining(time_remaining)})")
+                print(f"Plan: {self.plan.upper()}")
+                
+                # Claude Resource Usage
+                claude_pct = min((claude_units / self.base_limit) * 100, 100) if self.base_limit != float('inf') else 0
+                print(f"\nRESOURCE USAGE:")
+                bar_filled = int(claude_pct / 2.5)
+                bar = "█" * bar_filled + "░" * (40 - bar_filled)
+                indicator = "🟢" if claude_pct < 50 else "🟡" if claude_pct < 80 else "🔴"
+                print(f"{indicator} [{bar}] {claude_pct:.1f}%")
+                print(f"   {claude_units:.1f} / {self.base_limit} units ({claude_msgs} messages)")
+                
+                # Claude Model Breakdown
+                print(f"\nMODEL BREAKDOWN:")
+                for model_type in ['opus', 'sonnet', 'haiku']:
+                    count = data['messages_by_type'].get(model_type, 0)
+                    units = data['resource_units_by_type'].get(model_type, 0)
+                    if count > 0:
+                        emoji = "🔴" if model_type == 'opus' else "🟡" if model_type == 'sonnet' else "🟢"
+                        print(f"   {emoji} {model_type.capitalize()}: {count} messages = {units:.1f} units")
+                
+                # Claude Token Usage
+                print(f"\nTOKEN USAGE:")
+                print(f"   Input: {data['token_stats']['input']:,}")
+                print(f"   Output: {data['token_stats']['output']:,} (×10 weight)")
+                print(f"   Cache: {data['token_stats']['cache_create']:,} created, {data['token_stats']['cache_read']:,} read (free)")
+                
+                # Claude API Cost Projection
+                if self.config['preferences']['show_cost_projections'] and costs['claude']['total'] > 0:
+                    print(f"\nAPI COST PROJECTION:")
+                    breakdown_parts = []
+                    if costs['claude']['input'] > 0:
+                        breakdown_parts.append(f"Input: ${costs['claude']['input']:.2f}")
+                    if costs['claude']['output'] > 0:
+                        breakdown_parts.append(f"Output: ${costs['claude']['output']:.2f}")
+                    if costs['claude']['cache_write'] > 0:
+                        breakdown_parts.append(f"Cache Write: ${costs['claude']['cache_write']:.2f}")
+                    if costs['claude']['cache_read'] > 0:
+                        breakdown_parts.append(f"Cache Read: ${costs['claude']['cache_read']:.2f}")
+                    print(f"   ${costs['claude']['total']:.2f} ({', '.join(breakdown_parts)})")
+            else:
+                print("\nNo Claude usage in current session")
+        
+        # GEMINI AI SERVICES SECTION
+        if 'gemini' in self.services_found:
+            print(f"\n{'='*60}")
+            print("💎 GEMINI AI SERVICES")
+            print(f"{'='*60}")
+            
+            if gemini_msgs > 0:
+                # Time window info
+                day_start, day_end = self.get_daily_window()
+                time_remaining = (day_end - now).total_seconds() / 60
+                print(f"\nDaily usage (resets in {self.format_time_remaining(time_remaining)})")
+                print(f"Plan: {self.gemini_plan.upper()}")
+                
+                # Gemini Resource Usage
+                print(f"\nRESOURCE USAGE:")
+                if self.gemini_plan != 'api':
+                    gemini_limit = self.gemini_limits.get(self.gemini_plan, 1500)  # Daily limit
+                    gemini_pct = min((gemini_msgs / gemini_limit) * 100, 100)
+                    bar_filled = int(gemini_pct / 2.5)
+                    bar = "█" * bar_filled + "░" * (40 - bar_filled)
+                    indicator = "🟢" if gemini_pct < 50 else "🟡" if gemini_pct < 80 else "🔴"
+                    print(f"{indicator} [{bar}] {gemini_pct:.1f}%")
+                    print(f"   {gemini_msgs} / {gemini_limit} daily requests")
+                else:
+                    print(f"🟢 {gemini_msgs} requests (API - no limit)")
+                
+                # Gemini Model Breakdown
+                print(f"\nMODEL BREAKDOWN:")
+                gemini_models = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
+                for model_type in gemini_models:
+                    count = data['messages_by_type'].get(model_type, 0)
+                    if count > 0:
+                        emoji = "💎" if 'pro' in model_type else "⚡"
+                        model_display = model_type.replace('gemini-', '').replace('-', ' ').title()
+                        print(f"   {emoji} {model_display}: {count} messages")
+                
+                # Gemini Token Usage
+                print(f"\nTOKEN USAGE:")
+                if 'gemini_tokens' in data and data['gemini_tokens']['input'] > 0:
+                    print(f"   Input: {data['gemini_tokens']['input']:,}")
+                    print(f"   Output: {data['gemini_tokens']['output']:,}")
+                    if data['gemini_tokens'].get('cached', 0) > 0:
+                        print(f"   Cache: {data['gemini_tokens']['cached']:,} (saved from input)")
+                else:
+                    print(f"   Token tracking data not found in logs")
+                
+                # Gemini API Cost Projection
+                if self.config['preferences']['show_cost_projections']:
+                    if costs['gemini']['total'] > 0:
+                        print(f"\nAPI COST PROJECTION:")
+                        breakdown_parts = []
+                        if costs['gemini']['input'] > 0:
+                            breakdown_parts.append(f"Input: ${costs['gemini']['input']:.2f}")
+                        if costs['gemini']['output'] > 0:
+                            breakdown_parts.append(f"Output: ${costs['gemini']['output']:.2f}")
+                        cost_str = f"${costs['gemini']['total']:.2f}"
+                        if breakdown_parts:
+                            cost_str += f" ({', '.join(breakdown_parts)})"
+                        print(f"   {cost_str}")
+            else:
+                print("\nNo Gemini usage today")
+                    
+def self_update():
+    """Update MonitorMV to the latest version"""
+    print("\n🔄 MonitorMV Self-Updater")
+    print("=" * 50)
+    print(f"Current version: v{__version__}")
+    print("\nChecking for updates...")
+    
+    # GitHub raw URL for the latest version
+    update_url = "https://raw.githubusercontent.com/casuallearning/MonitorMV/main/monitormv"
+    
+    try:
+        # Download to temporary file
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.py') as tmp_file:
+            tmp_path = tmp_file.name
+            
+        # Use curl to download (more reliable than urllib)
+        result = subprocess.run(
+            ["curl", "-fsSL", "-o", tmp_path, update_url],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print(f"❌ Failed to download update: {result.stderr}")
+            return False
+            
+        # Read the version from downloaded file
+        with open(tmp_path, 'r') as f:
+            content = f.read()
+            
+        # Extract version
+        version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+        if not version_match:
+            print("❌ Could not determine version of downloaded file")
+            os.unlink(tmp_path)
+            return False
+            
+        new_version = version_match.group(1)
+        
+        # Compare versions
+        if new_version == __version__:
+            print(f"✅ You already have the latest version (v{__version__})")
+            os.unlink(tmp_path)
+            return True
+            
+        print(f"\n📦 New version available: v{new_version}")
+        
+        # Find where MonitorMV is installed
+        current_path = os.path.realpath(sys.argv[0])
+        print(f"Current installation: {current_path}")
+        
+        # Ask for confirmation
+        confirm = input(f"\nUpdate MonitorMV from v{__version__} to v{new_version}? (y/n): ").lower().strip()
+        
+        if confirm != 'y':
+            print("\n❌ Update cancelled")
+            os.unlink(tmp_path)
+            return False
+            
+        # Create backup
+        backup_path = current_path + '.backup'
+        try:
+            shutil.copy2(current_path, backup_path)
+            print(f"✓ Created backup: {backup_path}")
+        except Exception as e:
+            print(f"⚠️  Could not create backup: {e}")
+            
+        # Check if we need sudo
+        needs_sudo = False
+        if not os.access(current_path, os.W_OK):
+            needs_sudo = True
+            print("\n⚠️  Update requires sudo privileges")
+            
+        # Perform update
+        try:
+            if needs_sudo:
+                # Use sudo to copy
+                result = subprocess.run(
+                    ["sudo", "cp", tmp_path, current_path],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode != 0:
+                    raise Exception(f"sudo failed: {result.stderr}")
+                    
+                # Make executable
+                subprocess.run(["sudo", "chmod", "+x", current_path])
+            else:
+                # Direct copy
+                shutil.copy2(tmp_path, current_path)
+                os.chmod(current_path, 0o755)
+                
+            print(f"\n✅ Successfully updated to v{new_version}!")
+            print("\nWhat's new: Check https://github.com/casuallearning/MonitorMV/releases")
+            
+            # Clean up
+            os.unlink(tmp_path)
+            
+            # Remove old backup if update successful
+            try:
+                if os.path.exists(backup_path):
+                    os.unlink(backup_path)
+            except:
+                pass
+                
+            return True
+            
+        except Exception as e:
+            print(f"\n❌ Update failed: {e}")
+            
+            # Try to restore backup
+            if os.path.exists(backup_path):
+                try:
+                    if needs_sudo:
+                        subprocess.run(["sudo", "cp", backup_path, current_path])
+                    else:
+                        shutil.copy2(backup_path, current_path)
+                    print("✓ Restored from backup")
+                except:
+                    print(f"⚠️  Could not restore backup from {backup_path}")
+                    
+            os.unlink(tmp_path)
+            return False
+            
+    except Exception as e:
+        print(f"❌ Update error: {e}")
+        return False
+
+def self_uninstall():
+    """Uninstall MonitorMV from the system"""
+    print("\n🗑️  MonitorMV Uninstaller")
+    print("=" * 50)
+    
+    # Find installation location
+    current_path = os.path.realpath(sys.argv[0])
+    print(f"\nFound MonitorMV at: {current_path}")
+    
+    # Find config directory
+    config_dir = Path.home() / '.monitormv'
+    config_exists = config_dir.exists()
+    
+    # Find completion files
+    completion_files = []
+    
+    # Check zsh completions
+    zsh_completion = Path.home() / '.zsh' / 'completions' / '_monitormv'
+    if zsh_completion.exists():
+        completion_files.append(str(zsh_completion))
+    
+    # Check bash completions
+    bash_locations = [
+        '/etc/bash_completion.d/monitormv',
+        Path.home() / '.local' / 'share' / 'bash-completion' / 'completions' / 'monitormv'
+    ]
+    for loc in bash_locations:
+        if Path(loc).exists():
+            completion_files.append(str(loc))
+    
+    # Show what will be removed
+    print("\nThe following will be removed:")
+    print(f"  • MonitorMV binary: {current_path}")
+    if config_exists:
+        print(f"  • Configuration directory: {config_dir}")
+    for comp_file in completion_files:
+        print(f"  • Completion file: {comp_file}")
+    
+    # Ask for confirmation
+    confirm = input("\nAre you sure you want to uninstall MonitorMV? (y/N): ").lower().strip()
+    
+    if confirm != 'y':
+        print("\n❌ Uninstall cancelled")
+        return False
+    
+    # Remove binary
+    try:
+        if os.access(current_path, os.W_OK):
+            os.unlink(current_path)
+            print(f"✓ Removed {current_path}")
+        else:
+            # Need sudo
+            print("\n⚠️  Uninstall requires sudo privileges")
+            result = subprocess.run(
+                ["sudo", "rm", current_path],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                print(f"✓ Removed {current_path}")
+            else:
+                print(f"❌ Failed to remove {current_path}: {result.stderr}")
+                return False
+    except Exception as e:
+        print(f"❌ Error removing binary: {e}")
+        return False
+    
+    # Remove config directory
+    if config_exists:
+        try:
+            shutil.rmtree(config_dir)
+            print(f"✓ Removed configuration directory")
+        except Exception as e:
+            print(f"⚠️  Could not remove config directory: {e}")
+    
+    # Remove completion files
+    for comp_file in completion_files:
+        try:
+            if os.access(comp_file, os.W_OK):
+                os.unlink(comp_file)
+                print(f"✓ Removed {comp_file}")
+            else:
+                # Try with sudo for system files
+                if '/etc/' in comp_file:
+                    subprocess.run(["sudo", "rm", comp_file], capture_output=True)
+                    print(f"✓ Removed {comp_file}")
+        except Exception as e:
+            print(f"⚠️  Could not remove {comp_file}: {e}")
+    
+    # Clean up shell configurations
+    shell_configs_cleaned = []
+    
+    # Check and clean .bashrc
+    bashrc = Path.home() / '.bashrc'
+    if bashrc.exists():
+        try:
+            with open(bashrc, 'r') as f:
+                lines = f.readlines()
+            
+            # Filter out MonitorMV related lines
+            new_lines = []
+            skip_next = False
+            for line in lines:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if 'MonitorMV' in line or 'monitormv' in line:
+                    if line.strip() == '# MonitorMV completion':
+                        skip_next = True
+                    continue
+                new_lines.append(line)
+            
+            # Write back if changed
+            if len(new_lines) != len(lines):
+                with open(bashrc, 'w') as f:
+                    f.writelines(new_lines)
+                shell_configs_cleaned.append('~/.bashrc')
+                print("✓ Cleaned MonitorMV entries from ~/.bashrc")
+        except Exception as e:
+            print(f"⚠️  Could not clean ~/.bashrc: {e}")
+    
+    # Check and clean .zshrc
+    zshrc = Path.home() / '.zshrc'
+    if zshrc.exists():
+        try:
+            with open(zshrc, 'r') as f:
+                lines = f.readlines()
+            
+            # Filter out MonitorMV related lines
+            new_lines = []
+            skip_count = 0
+            for line in lines:
+                if skip_count > 0:
+                    skip_count -= 1
+                    continue
+                if 'MonitorMV' in line or 'monitormv' in line:
+                    if line.strip() == '# MonitorMV completion':
+                        skip_count = 2  # Skip this line and next 2
+                    continue
+                if 'fpath=(~/.zsh/completions' in line and '/.zsh/completions/_monitormv' in str(completion_files):
+                    skip_count = 1  # Skip this line and next
+                    continue
+                new_lines.append(line)
+            
+            # Write back if changed
+            if len(new_lines) != len(lines):
+                with open(zshrc, 'w') as f:
+                    f.writelines(new_lines)
+                shell_configs_cleaned.append('~/.zshrc')
+                print("✓ Cleaned MonitorMV entries from ~/.zshrc")
+        except Exception as e:
+            print(f"⚠️  Could not clean ~/.zshrc: {e}")
+    
+    print("\n✅ MonitorMV has been uninstalled!")
+    
+    if shell_configs_cleaned:
+        print("\n💡 Shell configuration cleaned. Please restart your terminal or run:")
+        if '~/.bashrc' in shell_configs_cleaned:
+            print("   source ~/.bashrc")
+        if '~/.zshrc' in shell_configs_cleaned:
+            print("   source ~/.zshrc")
+    
+    print("\nThank you for using MonitorMV!")
+    print("Part of the Mea Vita AI Development Suite")
+    print("Visit https://github.com/casuallearning for more tools\n")
+    
+    # Exit since the binary is now gone
+    sys.exit(0)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=f'MonitorMV - Universal AI usage monitor for Claude and Gemini',
+        epilog='Part of Mea Vita AI Development Suite | Report issues: https://github.com/casuallearning/MonitorMV'
+    )
+    parser.add_argument('--setup', action='store_true',
+                        help='Run initial setup wizard')
+    parser.add_argument('--update', action='store_true',
+                        help='Update MonitorMV to the latest version')
+    parser.add_argument('--uninstall', action='store_true',
+                        help='Uninstall MonitorMV from your system')
+    parser.add_argument('--claude', action='store_const', const='claude', dest='service',
+                        help='Monitor only Claude usage')
+    parser.add_argument('--gemini', action='store_const', const='gemini', dest='service',
+                        help='Monitor only Gemini usage')
+    parser.add_argument('--plan', choices=['claude-pro', 'claude-max5', 'claude-max20', 'claude-api',
+                                           'gemini-free', 'gemini-paid', 'gemini-api',
+                                           'pro', 'max5', 'max20'],  # Keep old options for compatibility
+                        help='Subscription plan (default: auto-detect)')
+    parser.add_argument('--simple', action='store_true',
+                        help='Use simple text mode')
+    parser.add_argument('--once', action='store_true',
+                        help='Run once and exit')
+    parser.add_argument('--version', action='version',
+                        version=f'MonitorMV v{__version__} | Mea Vita')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Handle uninstall
+        if args.uninstall:
+            self_uninstall()
+            return
+            
+        # Handle self-update
+        if args.update:
+            self_update()
+            return
+            
+        # Handle setup wizard
+        config_manager = ConfigManager()
+        
+        if args.setup:
+            config = config_manager.run_initial_setup()
+            return
+            
+        # Check if first run
+        config_path = Path.home() / '.monitormv' / 'config.json'
+        if not config_path.exists():
+            # Clear screen for better visibility
+            os.system('clear' if os.name != 'nt' else 'cls')
+            
+            print("\n🎉 Welcome to MonitorMV!")
+            print("This appears to be your first time running MonitorMV.")
+            run_setup = input("\nWould you like to run the setup wizard? (y/n) [y]: ").lower().strip()
+            
+            if run_setup != 'n':
+                config = config_manager.run_initial_setup()
+                print("\n\nStarting MonitorMV...\n")
+                time.sleep(2)
+                os.system('clear' if os.name != 'nt' else 'cls')
+            else:
+                print("\nYou can run setup later with: monitormv --setup")
+                print("\nUsing default settings...")
+                config = config_manager.default_config
+                time.sleep(2)
+        else:
+            config = config_manager.load_config()
+            
+        tracker = MonitorMV(plan=args.plan, service=args.service, config=config)
+        
+        if args.once:
+            tracker.run_once()
+        elif args.simple:
+            tracker.run_simple()
+        else:
+            try:
+                curses.wrapper(tracker.draw_dashboard)
+            except Exception as e:
+                print(f"\n⚠️  Interactive mode failed: {e}")
+                print("Falling back to simple mode...\n")
+                time.sleep(1)
+                tracker.run_simple()
+                
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
