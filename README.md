@@ -41,7 +41,11 @@ The goal is just to give you a better sense of how you're using your AI subscrip
 
 ### Quick install
 ```bash
-curl -fsSL https://raw.githubusercontent.com/casuallearning/MV_Claude_Monitor/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/casuallearning/MV_Claude_Monitor/main/install.sh -o install.sh
+  bash install.sh
+
+  Or for a one-liner (if your system supports it):
+  curl -fsSL https://raw.githubusercontent.com/casuallearning/MV_Claude_Monitor/main/install.sh | bash
 ```
 
 ### Manual install
