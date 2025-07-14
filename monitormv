@@ -38,7 +38,7 @@ import tempfile
 import shutil
 import re
 
-__version__ = "5.9.0"
+__version__ = "5.10.0"
 __author__ = "Phil Hudson / Mea Vita"
 __app_name__ = "MonitorMV"
 
